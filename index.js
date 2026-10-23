@@ -1,5 +1,7 @@
 /**
- * IZ Earn — Device Verify Worker v2.1
+ * IZ Earn Device Verify Worker v3
+ * - initData HMAC when present (inline button)
+ * - keyboard launch: initData may be EMPTY (Telegram rule) → uid=0 in token
  * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
  * KV: VERIFY_KV
  */
@@ -8,13 +10,13 @@ const INIT_MAX_AGE_SEC = 86400;
 const TOKEN_TTL_SEC = 300;
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return cors(new Response(null, { status: 204 }));
     }
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") {
-      return cors(json({ ok: true, service: "iz-device-verify", v: 2 }));
+      return cors(json({ ok: true, service: "iz-device-verify", v: 3 }));
     }
     if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/verify")) {
       try {
@@ -57,14 +59,15 @@ async function handleVerify(request, env) {
     }
   }
 
-  if (!initData || initData.length < 20) {
-    return json({ ok: false, reason: "init_data", ban: false, detail: "missing" });
+  let uid = "0";
+  if (initData && initData.length >= 20) {
+    const initResult = await validateInitData(initData, botToken, INIT_MAX_AGE_SEC);
+    if (!initResult.ok) {
+      return json({ ok: false, reason: "init_data", ban: false, detail: initResult.detail });
+    }
+    uid = String(initResult.userId);
   }
-  const initResult = await validateInitData(initData, botToken, INIT_MAX_AGE_SEC);
-  if (!initResult.ok) {
-    return json({ ok: false, reason: "init_data", ban: false, detail: initResult.detail });
-  }
-  const uid = String(initResult.userId);
+  // else: keyboard launch — Telegram leaves initData empty; bot trusts message.from_user
 
   const ip = clientIp(request);
   if (!ip || ip === "0.0.0.0") {
@@ -81,7 +84,7 @@ async function handleVerify(request, env) {
   }
 
   const kv = env.VERIFY_KV;
-  if (kv) {
+  if (kv && uid !== "0") {
     const devKey = "dev:" + fingerprint;
     const ipKey = "ip:" + ip;
     const existingDev = await kv.get(devKey);
@@ -97,12 +100,25 @@ async function handleVerify(request, env) {
     await kv.put("user:" + uid, JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) }));
   }
 
+  // For keyboard mode (uid=0), still bind device by fingerprint only after bot assigns user
+  // Bot will write used_devices / used_ips
+
   const exp = Math.floor(now / 1000) + TOKEN_TTL_SEC;
   const payload = ["ok", uid, fingerprint, ip, String(exp)].join("|");
   const sig = await hmacHex(resultSecret, payload);
   const token = payload + "|" + sig;
 
-  return json({ ok: true, reason: "pass", ban: false, uid, ip, fingerprint, exp, token });
+  return json({
+    ok: true,
+    reason: "pass",
+    ban: false,
+    uid,
+    ip,
+    fingerprint,
+    exp,
+    token,
+    mode: uid === "0" ? "keyboard" : "initdata",
+  });
 }
 
 function clientIp(request) {
@@ -116,7 +132,6 @@ function clientIp(request) {
 
 async function validateInitData(initData, botToken, maxAgeSec) {
   try {
-    // Parse without URLSearchParams edge cases
     const map = {};
     for (const part of initData.split("&")) {
       const eq = part.indexOf("=");
@@ -179,7 +194,6 @@ async function validateInitData(initData, botToken, maxAgeSec) {
       } catch (_) {}
     }
     if (!userId) return { ok: false, detail: "no_user" };
-
     return { ok: true, userId, authDate };
   } catch (e) {
     return { ok: false, detail: "validate_error:" + String(e && e.message || e) };
