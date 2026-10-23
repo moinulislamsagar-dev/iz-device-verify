@@ -1,17 +1,9 @@
 /**
- * IZ Earn Device Verify Worker v5 — STRICT initData always
+ * IZ Earn Device Verify Worker v6
+ * STRICT initData — tries both HMAC key orders (docs ambiguity)
+ * Cleans BOT_TOKEN (quotes, BOM, whitespace)
  *
- * Telegram + Telebot Creator constraints:
- * - Reply keyboard web_app: initData EMPTY, sendData works
- * - Inline web_app: initData PRESENT, sendData does NOT work (TBC docs)
- *
- * Therefore:
- * - Mini App opens via INLINE button only
- * - Worker ALWAYS validates initData HMAC (no optional path)
- * - On success stores verified:{uid} in KV
- * - Bot confirms via GET /check (no sendData required)
- *
- * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET (recommended)
+ * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
  * KV: VERIFY_KV
  */
 
@@ -29,12 +21,15 @@ export default {
       return cors(json({
         ok: true,
         service: "iz-device-verify",
-        v: 5,
+        v: 6,
         mode: "strict_initdata",
       }));
     }
 
-    // Bot polls this after user finishes Mini App
+    if (request.method === "GET" && url.pathname === "/diag") {
+      return cors(handleDiag(env, url, request));
+    }
+
     if (request.method === "GET" && url.pathname === "/check") {
       return cors(await handleCheck(request, env, url));
     }
@@ -55,8 +50,40 @@ export default {
   },
 };
 
+function cleanToken(raw) {
+  let t = String(raw || "");
+  t = t.replace(/^\uFEFF/, ""); // BOM
+  t = t.trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    t = t.slice(1, -1).trim();
+  }
+  t = t.replace(/\r|\n/g, "").trim();
+  return t;
+}
+
+function handleDiag(env, url, request) {
+  const token = cleanToken(env.BOT_TOKEN);
+  const secret = cleanToken(env.RESULT_SECRET);
+  const given =
+    request.headers.get("X-Result-Secret") ||
+    url.searchParams.get("secret") ||
+    "";
+  const botId = token.includes(":") ? token.split(":")[0] : "";
+  return json({
+    ok: true,
+    v: 6,
+    bot_token_set: token.length > 10,
+    bot_token_length: token.length,
+    bot_id: botId || null,
+    result_secret_set: secret.length > 5,
+    turnstile_set: !!cleanToken(env.TURNSTILE_SECRET),
+    kv_bound: !!env.VERIFY_KV,
+    auth: secret && given === secret ? "ok" : "basic",
+  });
+}
+
 async function handleCheck(request, env, url) {
-  const secret = String(env.RESULT_SECRET || "").trim();
+  const secret = cleanToken(env.RESULT_SECRET);
   const given =
     request.headers.get("X-Result-Secret") ||
     url.searchParams.get("secret") ||
@@ -66,14 +93,10 @@ async function handleCheck(request, env, url) {
   }
   const uid = String(url.searchParams.get("uid") || "").trim();
   if (!uid) return json({ ok: false, reason: "missing_uid" }, 400);
-
   const kv = env.VERIFY_KV;
   if (!kv) return json({ ok: false, reason: "no_kv" }, 500);
-
   const raw = await kv.get("verified:" + uid);
-  if (!raw) {
-    return json({ ok: true, verified: false });
-  }
+  if (!raw) return json({ ok: true, verified: false });
   let data;
   try {
     data = JSON.parse(raw);
@@ -95,8 +118,8 @@ async function handleCheck(request, env, url) {
 }
 
 async function handleVerify(request, env) {
-  const botToken = String(env.BOT_TOKEN || "").trim();
-  const resultSecret = String(env.RESULT_SECRET || "").trim();
+  const botToken = cleanToken(env.BOT_TOKEN);
+  const resultSecret = cleanToken(env.RESULT_SECRET);
   if (!botToken || !resultSecret) {
     return json({
       ok: false,
@@ -118,7 +141,6 @@ async function handleVerify(request, env) {
   const platform = String(body.platform || "").slice(0, 32);
   const now = Date.now();
 
-  // STRICT initData
   if (!initData || initData.length < 30) {
     return json({
       ok: false,
@@ -128,30 +150,31 @@ async function handleVerify(request, env) {
     });
   }
 
-  const initResult = await validateInitData(initData, botToken, INIT_MAX_AGE_SEC);
+  const initResult = await validateInitDataStrict(initData, botToken, INIT_MAX_AGE_SEC);
   if (!initResult.ok) {
+    const botId = botToken.includes(":") ? botToken.split(":")[0] : "?";
     return json({
       ok: false,
       reason: "init_data",
       ban: false,
       detail: initResult.detail,
+      worker_bot_id: botId,
       hint:
         initResult.detail === "bad_hash"
-          ? "Worker BOT_TOKEN must be the exact @BotFather token of this bot"
+          ? "Worker bot_id=" +
+            botId +
+            ". Must be the SAME bot that shows the Verify button. Re-paste token from @BotFather."
           : undefined,
     });
   }
   const uid = String(initResult.userId);
 
   if (env.TURNSTILE_SECRET) {
+    const tsSecret = cleanToken(env.TURNSTILE_SECRET);
     if (!turnstileToken) {
       return json({ ok: false, reason: "turnstile", ban: false, detail: "missing_token" });
     }
-    const tsOk = await verifyTurnstile(
-      turnstileToken,
-      String(env.TURNSTILE_SECRET).trim(),
-      clientIp(request)
-    );
+    const tsOk = await verifyTurnstile(turnstileToken, tsSecret, clientIp(request));
     if (!tsOk) {
       return json({ ok: false, reason: "turnstile", ban: false, detail: "failed" });
     }
@@ -205,7 +228,6 @@ async function handleVerify(request, env) {
       "user:" + uid,
       JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) })
     );
-    // For bot confirm step (inline cannot sendData)
     await kv.put(
       "verified:" + uid,
       JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) }),
@@ -239,73 +261,110 @@ function clientIp(request) {
   );
 }
 
-async function validateInitData(initData, botToken, maxAgeSec) {
-  try {
-    const params = new URLSearchParams(initData);
-    const hash = params.get("hash");
-    if (!hash) return { ok: false, detail: "no_hash" };
+async function hmacSign(keyBytes, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes instanceof ArrayBuffer ? keyBytes : enc.encode(keyBytes),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const msg = typeof message === "string" ? enc.encode(message) : message;
+  return await crypto.subtle.sign("HMAC", key, msg);
+}
 
+function toHex(buf) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Build data-check-string and verify hash.
+ * Tries:
+ *  1) URLSearchParams values
+ *  2) Manual decode parse
+ *  3) HMAC key order A: key=WebAppData, msg=token  (Node/aiogram standard)
+ *  4) HMAC key order B: key=token, msg=WebAppData  (literal doc reading)
+ */
+async function validateInitDataStrict(initData, botToken, maxAgeSec) {
+  const maps = [parseInitDataURLSearch(initData), parseInitDataManual(initData)];
+
+  for (const map of maps) {
+    if (!map || !map.hash) continue;
     const pairs = [];
-    for (const [k, v] of params.entries()) {
+    for (const k of Object.keys(map)) {
       if (k === "hash" || k === "signature") continue;
-      pairs.push(k + "=" + v);
+      pairs.push(k + "=" + map[k]);
     }
     pairs.sort();
     const dataCheckString = pairs.join("\n");
 
-    const enc = new TextEncoder();
-    const secretKeyBytes = await crypto.subtle.sign(
-      "HMAC",
-      await crypto.subtle.importKey(
-        "raw",
-        enc.encode("WebAppData"),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-      ),
-      enc.encode(botToken)
-    );
-    const sigBuf = await crypto.subtle.sign(
-      "HMAC",
-      await crypto.subtle.importKey(
-        "raw",
-        secretKeyBytes,
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-      ),
-      enc.encode(dataCheckString)
-    );
-    const computed = [...new Uint8Array(sigBuf)]
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    if (computed !== String(hash).toLowerCase()) {
-      return { ok: false, detail: "bad_hash" };
+    // Order A (standard)
+    const skA = await hmacSign("WebAppData", botToken);
+    const hashA = toHex(await hmacSign(skA, dataCheckString));
+    if (hashA === String(map.hash).toLowerCase()) {
+      return finishInit(map, maxAgeSec);
     }
 
-    const authDate = parseInt(params.get("auth_date") || "0", 10);
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (!authDate || nowSec - authDate > maxAgeSec) {
-      return { ok: false, detail: "expired" };
+    // Order B (alternate)
+    const skB = await hmacSign(botToken, "WebAppData");
+    const hashB = toHex(await hmacSign(skB, dataCheckString));
+    if (hashB === String(map.hash).toLowerCase()) {
+      return finishInit(map, maxAgeSec);
     }
-    if (authDate > nowSec + 120) {
-      return { ok: false, detail: "auth_in_future" };
-    }
-
-    let userId = "";
-    const userRaw = params.get("user");
-    if (userRaw) {
-      try {
-        const user = JSON.parse(userRaw);
-        if (user && user.id) userId = String(user.id);
-      } catch (_) {}
-    }
-    if (!userId) return { ok: false, detail: "no_user" };
-    return { ok: true, userId, authDate };
-  } catch (e) {
-    return { ok: false, detail: "validate_error:" + String(e && e.message || e) };
   }
+
+  return { ok: false, detail: "bad_hash" };
+}
+
+function parseInitDataURLSearch(initData) {
+  try {
+    const params = new URLSearchParams(initData);
+    const map = {};
+    for (const [k, v] of params.entries()) map[k] = v;
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+function parseInitDataManual(initData) {
+  try {
+    const map = {};
+    for (const part of initData.split("&")) {
+      const eq = part.indexOf("=");
+      if (eq < 0) continue;
+      const k = decodeURIComponent(part.slice(0, eq));
+      let v = part.slice(eq + 1);
+      try {
+        v = decodeURIComponent(v.replace(/\+/g, " "));
+      } catch (_) {}
+      map[k] = v;
+    }
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+function finishInit(map, maxAgeSec) {
+  const authDate = parseInt(map.auth_date || "0", 10);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!authDate || nowSec - authDate > maxAgeSec) {
+    return { ok: false, detail: "expired" };
+  }
+  if (authDate > nowSec + 120) {
+    return { ok: false, detail: "auth_in_future" };
+  }
+  let userId = "";
+  if (map.user) {
+    try {
+      const user = JSON.parse(map.user);
+      if (user && user.id) userId = String(user.id);
+    } catch (_) {}
+  }
+  if (!userId) return { ok: false, detail: "no_user" };
+  return { ok: true, userId, authDate };
 }
 
 async function checkVpn(ip, proxycheckKey) {
@@ -379,16 +438,8 @@ async function verifyTurnstile(token, secret, ip) {
 }
 
 async function hmacHex(secret, message) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const buf = await crypto.subtle.sign("HMAC", key, enc.encode(message));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const buf = await hmacSign(secret, message);
+  return toHex(buf);
 }
 
 function json(obj, status = 200) {
