@@ -1,15 +1,10 @@
 /**
- * IZ Earn — Device Verify Worker v2
- * initData HMAC, CF IP, VPN, KV, Turnstile, signed token
- * 7s timing = Telegram bot only (not here)
- *
- * Cloudflare Secrets (NOT in this file):
- *   BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
- * Optional: PROXYCHECK_KEY
- * KV binding: VERIFY_KV
+ * IZ Earn — Device Verify Worker v2.1
+ * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
+ * KV: VERIFY_KV
  */
 
-const INIT_MAX_AGE_SEC = 3600;
+const INIT_MAX_AGE_SEC = 86400;
 const TOKEN_TTL_SEC = 300;
 
 export default {
@@ -33,7 +28,9 @@ export default {
 };
 
 async function handleVerify(request, env) {
-  if (!env.BOT_TOKEN || !env.RESULT_SECRET) {
+  const botToken = String(env.BOT_TOKEN || "").trim();
+  const resultSecret = String(env.RESULT_SECRET || "").trim();
+  if (!botToken || !resultSecret) {
     return json({ ok: false, reason: "misconfigured", detail: "BOT_TOKEN or RESULT_SECRET missing" }, 500);
   }
 
@@ -44,7 +41,7 @@ async function handleVerify(request, env) {
     return json({ ok: false, reason: "bad_json" }, 400);
   }
 
-  const initData = String(body.initData || "");
+  const initData = String(body.initData || "").trim();
   const fingerprint = String(body.fingerprint || body.fp || "").slice(0, 128);
   const turnstileToken = String(body.turnstileToken || body.cf_turnstile_response || "");
   const platform = String(body.platform || "").slice(0, 32);
@@ -54,7 +51,7 @@ async function handleVerify(request, env) {
     if (!turnstileToken) {
       return json({ ok: false, reason: "turnstile", ban: false, detail: "missing_token" });
     }
-    const tsOk = await verifyTurnstile(turnstileToken, env.TURNSTILE_SECRET, clientIp(request));
+    const tsOk = await verifyTurnstile(turnstileToken, String(env.TURNSTILE_SECRET).trim(), clientIp(request));
     if (!tsOk) {
       return json({ ok: false, reason: "turnstile", ban: false, detail: "failed" });
     }
@@ -63,7 +60,7 @@ async function handleVerify(request, env) {
   if (!initData || initData.length < 20) {
     return json({ ok: false, reason: "init_data", ban: false, detail: "missing" });
   }
-  const initResult = await validateInitData(initData, env.BOT_TOKEN, INIT_MAX_AGE_SEC);
+  const initResult = await validateInitData(initData, botToken, INIT_MAX_AGE_SEC);
   if (!initResult.ok) {
     return json({ ok: false, reason: "init_data", ban: false, detail: initResult.detail });
   }
@@ -102,7 +99,7 @@ async function handleVerify(request, env) {
 
   const exp = Math.floor(now / 1000) + TOKEN_TTL_SEC;
   const payload = ["ok", uid, fingerprint, ip, String(exp)].join("|");
-  const sig = await hmacHex(env.RESULT_SECRET, payload);
+  const sig = await hmacHex(resultSecret, payload);
   const token = payload + "|" + sig;
 
   return json({ ok: true, reason: "pass", ban: false, uid, ip, fingerprint, exp, token });
@@ -119,44 +116,70 @@ function clientIp(request) {
 
 async function validateInitData(initData, botToken, maxAgeSec) {
   try {
-    const params = new URLSearchParams(initData);
-    const hash = params.get("hash");
+    // Parse without URLSearchParams edge cases
+    const map = {};
+    for (const part of initData.split("&")) {
+      const eq = part.indexOf("=");
+      if (eq < 0) continue;
+      const k = decodeURIComponent(part.slice(0, eq));
+      const v = decodeURIComponent(part.slice(eq + 1).replace(/\+/g, " "));
+      map[k] = v;
+    }
+    const hash = map.hash;
     if (!hash) return { ok: false, detail: "no_hash" };
+
     const pairs = [];
-    for (const [k, v] of params.entries()) {
+    for (const k of Object.keys(map)) {
       if (k === "hash" || k === "signature") continue;
-      pairs.push(k + "=" + v);
+      pairs.push(k + "=" + map[k]);
     }
     pairs.sort();
     const dataCheckString = pairs.join("\n");
+
     const enc = new TextEncoder();
     const secretKey = await crypto.subtle.importKey(
       "raw",
       await crypto.subtle.sign(
         "HMAC",
-        await crypto.subtle.importKey("raw", enc.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+        await crypto.subtle.importKey(
+          "raw",
+          enc.encode("WebAppData"),
+          { name: "HMAC", hash: "SHA-256" },
+          false,
+          ["sign"]
+        ),
         enc.encode(botToken)
       ),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"]
     );
+
     const sigBuf = await crypto.subtle.sign("HMAC", secretKey, enc.encode(dataCheckString));
     const computed = [...new Uint8Array(sigBuf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-    if (computed !== hash.toLowerCase()) return { ok: false, detail: "bad_hash" };
-    const authDate = parseInt(params.get("auth_date") || "0", 10);
+
+    if (computed !== String(hash).toLowerCase()) {
+      return { ok: false, detail: "bad_hash" };
+    }
+
+    const authDate = parseInt(map.auth_date || "0", 10);
     const nowSec = Math.floor(Date.now() / 1000);
-    if (!authDate || nowSec - authDate > maxAgeSec) return { ok: false, detail: "expired" };
-    if (authDate > nowSec + 60) return { ok: false, detail: "auth_in_future" };
+    if (!authDate || nowSec - authDate > maxAgeSec) {
+      return { ok: false, detail: "expired" };
+    }
+    if (authDate > nowSec + 120) {
+      return { ok: false, detail: "auth_in_future" };
+    }
+
     let userId = "";
-    const userRaw = params.get("user");
-    if (userRaw) {
+    if (map.user) {
       try {
-        const user = JSON.parse(userRaw);
+        const user = JSON.parse(map.user);
         if (user && user.id) userId = String(user.id);
       } catch (_) {}
     }
     if (!userId) return { ok: false, detail: "no_user" };
+
     return { ok: true, userId, authDate };
   } catch (e) {
     return { ok: false, detail: "validate_error:" + String(e && e.message || e) };
@@ -166,7 +189,7 @@ async function validateInitData(initData, botToken, maxAgeSec) {
 async function checkVpn(ip, proxycheckKey) {
   try {
     const q = proxycheckKey
-      ? `https://proxycheck.io/v2/\( {encodeURIComponent(ip)}?key= \){encodeURIComponent(proxycheckKey)}&vpn=1&asn=1`
+      ? `https://proxycheck.io/v2/${encodeURIComponent(ip)}?key=${encodeURIComponent(proxycheckKey)}&vpn=1&asn=1`
       : `https://proxycheck.io/v2/${encodeURIComponent(ip)}?vpn=1&asn=1`;
     const r = await fetch(q, { cf: { cacheTtl: 120 } });
     if (r.ok) {
