@@ -1,23 +1,22 @@
 /**
- * IZ Earn Device Verify Worker v4
+ * IZ Earn Device Verify Worker v5 — STRICT initData always
  *
- * Telegram rule: initData is often EMPTY from reply-keyboard web_app.
- * Inline web_app may include initData; if HMAC fails (wrong token / parse),
- * we do NOT hard-fail — identity is always the Telegram user on web_app_data.
+ * Telegram + Telebot Creator constraints:
+ * - Reply keyboard web_app: initData EMPTY, sendData works
+ * - Inline web_app: initData PRESENT, sendData does NOT work (TBC docs)
  *
- * Security layers always applied:
- *  - Turnstile (if TURNSTILE_SECRET set)
- *  - Real IP (CF-Connecting-IP)
- *  - VPN/proxy detection (multi-source; fail closed on strong signals)
- *  - Device fingerprint required
- *  - KV 1-device / 1-IP when we know uid from valid initData
+ * Therefore:
+ * - Mini App opens via INLINE button only
+ * - Worker ALWAYS validates initData HMAC (no optional path)
+ * - On success stores verified:{uid} in KV
+ * - Bot confirms via GET /check (no sendData required)
  *
- * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
- * KV binding name: VERIFY_KV
+ * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET (recommended)
+ * KV: VERIFY_KV
  */
 
 const INIT_MAX_AGE_SEC = 86400;
-const TOKEN_TTL_SEC = 300;
+const VERIFY_TTL_SEC = 600;
 
 export default {
   async fetch(request, env) {
@@ -25,30 +24,85 @@ export default {
       return cors(new Response(null, { status: 204 }));
     }
     const url = new URL(request.url);
+
     if (request.method === "GET" && url.pathname === "/") {
-      return cors(json({ ok: true, service: "iz-device-verify", v: 4 }));
+      return cors(json({
+        ok: true,
+        service: "iz-device-verify",
+        v: 5,
+        mode: "strict_initdata",
+      }));
     }
+
+    // Bot polls this after user finishes Mini App
+    if (request.method === "GET" && url.pathname === "/check") {
+      return cors(await handleCheck(request, env, url));
+    }
+
     if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/verify")) {
       try {
         return cors(await handleVerify(request, env));
       } catch (e) {
-        return cors(
-          json({ ok: false, reason: "server_error", detail: String(e && e.message || e) }, 500)
-        );
+        return cors(json({
+          ok: false,
+          reason: "server_error",
+          detail: String(e && e.message || e),
+        }, 500));
       }
     }
+
     return cors(json({ ok: false, reason: "not_found" }, 404));
   },
 };
+
+async function handleCheck(request, env, url) {
+  const secret = String(env.RESULT_SECRET || "").trim();
+  const given =
+    request.headers.get("X-Result-Secret") ||
+    url.searchParams.get("secret") ||
+    "";
+  if (!secret || given !== secret) {
+    return json({ ok: false, reason: "unauthorized" }, 401);
+  }
+  const uid = String(url.searchParams.get("uid") || "").trim();
+  if (!uid) return json({ ok: false, reason: "missing_uid" }, 400);
+
+  const kv = env.VERIFY_KV;
+  if (!kv) return json({ ok: false, reason: "no_kv" }, 500);
+
+  const raw = await kv.get("verified:" + uid);
+  if (!raw) {
+    return json({ ok: true, verified: false });
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return json({ ok: true, verified: false });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (!data.at || now - data.at > VERIFY_TTL_SEC) {
+    return json({ ok: true, verified: false, reason: "expired" });
+  }
+  return json({
+    ok: true,
+    verified: true,
+    uid,
+    fp: data.fp || "",
+    ip: data.ip || "",
+    at: data.at,
+  });
+}
 
 async function handleVerify(request, env) {
   const botToken = String(env.BOT_TOKEN || "").trim();
   const resultSecret = String(env.RESULT_SECRET || "").trim();
   if (!botToken || !resultSecret) {
-    return json(
-      { ok: false, reason: "misconfigured", detail: "BOT_TOKEN or RESULT_SECRET missing" },
-      500
-    );
+    return json({
+      ok: false,
+      reason: "misconfigured",
+      detail: "BOT_TOKEN or RESULT_SECRET missing",
+    }, 500);
   }
 
   let body;
@@ -64,7 +118,31 @@ async function handleVerify(request, env) {
   const platform = String(body.platform || "").slice(0, 32);
   const now = Date.now();
 
-  // --- Turnstile (required when secret configured) ---
+  // STRICT initData
+  if (!initData || initData.length < 30) {
+    return json({
+      ok: false,
+      reason: "init_data",
+      ban: false,
+      detail: "missing_use_inline_button",
+    });
+  }
+
+  const initResult = await validateInitData(initData, botToken, INIT_MAX_AGE_SEC);
+  if (!initResult.ok) {
+    return json({
+      ok: false,
+      reason: "init_data",
+      ban: false,
+      detail: initResult.detail,
+      hint:
+        initResult.detail === "bad_hash"
+          ? "Worker BOT_TOKEN must be the exact @BotFather token of this bot"
+          : undefined,
+    });
+  }
+  const uid = String(initResult.userId);
+
   if (env.TURNSTILE_SECRET) {
     if (!turnstileToken) {
       return json({ ok: false, reason: "turnstile", ban: false, detail: "missing_token" });
@@ -79,26 +157,11 @@ async function handleVerify(request, env) {
     }
   }
 
-  // --- Optional initData (never hard-block whole verify on bad_hash) ---
-  let uid = "0";
-  let initMode = "none";
-  if (initData.length >= 20) {
-    const initResult = await validateInitData(initData, botToken, INIT_MAX_AGE_SEC);
-    if (initResult.ok) {
-      uid = String(initResult.userId);
-      initMode = "valid";
-    } else {
-      // Keep going — bot will use Telegram message user id
-      initMode = "invalid:" + (initResult.detail || "fail");
-    }
-  }
-
   const ip = clientIp(request);
   if (!ip || ip === "0.0.0.0") {
     return json({ ok: false, reason: "ip", ban: false, detail: "no_ip" });
   }
 
-  // --- VPN / proxy (multi-source) ---
   const net = await checkVpn(ip, env.PROXYCHECK_KEY || "");
   if (net.vpn) {
     return json({
@@ -114,9 +177,8 @@ async function handleVerify(request, env) {
     return json({ ok: false, reason: "fingerprint", ban: false, detail: "missing" });
   }
 
-  // --- KV uniqueness when uid known from valid initData ---
   const kv = env.VERIFY_KV;
-  if (kv && uid !== "0") {
+  if (kv) {
     const devKey = "dev:" + fingerprint;
     const ipKey = "ip:" + ip;
     const existingDev = await kv.get(devKey);
@@ -143,25 +205,15 @@ async function handleVerify(request, env) {
       "user:" + uid,
       JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) })
     );
+    // For bot confirm step (inline cannot sendData)
+    await kv.put(
+      "verified:" + uid,
+      JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) }),
+      { expirationTtl: VERIFY_TTL_SEC }
+    );
   }
 
-  // Also track fingerprint globally for keyboard mode (uid assigned by bot later)
-  if (kv) {
-    const fpHit = await kv.get("fp_any:" + fingerprint);
-    if (fpHit && uid !== "0" && fpHit !== uid) {
-      return json({
-        ok: false,
-        reason: "multi_device",
-        ban: true,
-        detail: "fp_any_" + fpHit,
-      });
-    }
-    if (uid !== "0") {
-      await kv.put("fp_any:" + fingerprint, uid);
-    }
-  }
-
-  const exp = Math.floor(now / 1000) + TOKEN_TTL_SEC;
+  const exp = Math.floor(now / 1000) + VERIFY_TTL_SEC;
   const payload = ["ok", uid, fingerprint, ip, String(exp)].join("|");
   const sig = await hmacHex(resultSecret, payload);
   const token = payload + "|" + sig;
@@ -175,7 +227,6 @@ async function handleVerify(request, env) {
     fingerprint,
     exp,
     token,
-    init_mode: initMode,
   });
 }
 
@@ -203,8 +254,7 @@ async function validateInitData(initData, botToken, maxAgeSec) {
     const dataCheckString = pairs.join("\n");
 
     const enc = new TextEncoder();
-    // secret = HMAC_SHA256(key=WebAppData, msg=botToken)
-    const skBits = await crypto.subtle.sign(
+    const secretKeyBytes = await crypto.subtle.sign(
       "HMAC",
       await crypto.subtle.importKey(
         "raw",
@@ -219,7 +269,7 @@ async function validateInitData(initData, botToken, maxAgeSec) {
       "HMAC",
       await crypto.subtle.importKey(
         "raw",
-        skBits,
+        secretKeyBytes,
         { name: "HMAC", hash: "SHA-256" },
         false,
         ["sign"]
@@ -259,10 +309,6 @@ async function validateInitData(initData, botToken, maxAgeSec) {
 }
 
 async function checkVpn(ip, proxycheckKey) {
-  // Returns { vpn: true/false, detail }
-  // Explicit proxy/vpn/tor → block. Network errors → try next source.
-
-  // 1) proxycheck.io
   try {
     const q = proxycheckKey
       ? `https://proxycheck.io/v2/${encodeURIComponent(ip)}?key=${encodeURIComponent(proxycheckKey)}&vpn=1&asn=1&risk=1`
@@ -275,29 +321,21 @@ async function checkVpn(ip, proxycheckKey) {
         const proxy = String(node.proxy || "").toLowerCase();
         const type = String(node.type || "").toLowerCase();
         const risk = Number(node.risk || 0);
-        if (proxy === "yes") {
-          return { vpn: true, detail: "proxycheck:proxy:" + (type || "yes") };
-        }
+        if (proxy === "yes") return { vpn: true, detail: "proxycheck:proxy" };
         if (
           type.includes("vpn") ||
           type.includes("tor") ||
           type.includes("socks") ||
           type.includes("proxy")
         ) {
-          return { vpn: true, detail: "proxycheck:type:" + type };
+          return { vpn: true, detail: "proxycheck:" + type };
         }
-        if (risk >= 66) {
-          return { vpn: true, detail: "proxycheck:risk:" + risk };
-        }
+        if (risk >= 66) return { vpn: true, detail: "proxycheck:risk:" + risk };
       }
     }
   } catch (_) {}
-
-  // 2) ipwho.is
   try {
-    const r2 = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, {
-      cf: { cacheTtl: 60 },
-    });
+    const r2 = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, { cf: { cacheTtl: 60 } });
     if (r2.ok) {
       const d2 = await r2.json();
       if (d2 && d2.success !== false && d2.security) {
@@ -308,26 +346,17 @@ async function checkVpn(ip, proxycheckKey) {
       }
     }
   } catch (_) {}
-
-  // 3) ipapi.is (free tier, no key)
   try {
     const r3 = await fetch(`https://api.ipapi.is/?q=${encodeURIComponent(ip)}`, {
       cf: { cacheTtl: 60 },
     });
     if (r3.ok) {
       const d3 = await r3.json();
-      if (d3) {
-        if (d3.is_vpn === true || d3.is_proxy === true || d3.is_tor === true) {
-          return { vpn: true, detail: "ipapi.is" };
-        }
-        if (d3.company && d3.company.type === "hosting" && d3.is_datacenter === true) {
-          // Datacenter IP used for multi-accounting often — block
-          return { vpn: true, detail: "ipapi.is:datacenter" };
-        }
+      if (d3 && (d3.is_vpn === true || d3.is_proxy === true || d3.is_tor === true)) {
+        return { vpn: true, detail: "ipapi.is" };
       }
     }
   } catch (_) {}
-
   return { vpn: false, detail: "clean" };
 }
 
@@ -373,6 +402,6 @@ function cors(res) {
   const h = new Headers(res.headers);
   h.set("Access-Control-Allow-Origin", "*");
   h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  h.set("Access-Control-Allow-Headers", "Content-Type");
+  h.set("Access-Control-Allow-Headers", "Content-Type, X-Result-Secret");
   return new Response(res.body, { status: res.status, headers: h });
 }
