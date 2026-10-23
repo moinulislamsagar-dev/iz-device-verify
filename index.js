@@ -30,6 +30,11 @@ export default {
       return cors(handleDiag(env, url, request));
     }
 
+    // Shows which Telegram bot BOT_TOKEN really is (via getMe)
+    if (request.method === "GET" && url.pathname === "/whoami") {
+      return cors(await handleWhoami(env));
+    }
+
     if (request.method === "GET" && url.pathname === "/check") {
       return cors(await handleCheck(request, env, url));
     }
@@ -59,6 +64,34 @@ function cleanToken(raw) {
   }
   t = t.replace(/\r|\n/g, "").trim();
   return t;
+}
+
+
+async function handleWhoami(env) {
+  const token = cleanToken(env.BOT_TOKEN);
+  if (!token || token.length < 10) {
+    return json({ ok: false, error: "BOT_TOKEN not set" });
+  }
+  try {
+    const r = await fetch("https://api.telegram.org/bot" + token + "/getMe");
+    const d = await r.json();
+    if (!d || !d.ok) {
+      return json({
+        ok: false,
+        error: "Telegram rejected token",
+        description: d && d.description ? d.description : "getMe failed",
+      });
+    }
+    return json({
+      ok: true,
+      id: d.result.id,
+      username: d.result.username || null,
+      name: d.result.first_name || null,
+      note: "Verify button must be opened from THIS bot only",
+    });
+  } catch (e) {
+    return json({ ok: false, error: String(e && e.message || e) });
+  }
 }
 
 function handleDiag(env, url, request) {
