@@ -1,10 +1,14 @@
 /**
- * IZ Earn — Device Verify Worker
- * initData HMAC, CF real IP, VPN, KV 1-device/1-IP, signed result
- * Client t0 age < 7s → ban: true
+ * IZ Earn — Device Verify Worker v2
+ * initData HMAC, CF IP, VPN, KV, Turnstile, signed token
+ * 7s timing = Telegram bot only (not here)
+ *
+ * Cloudflare Secrets (NOT in this file):
+ *   BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
+ * Optional: PROXYCHECK_KEY
+ * KV binding: VERIFY_KV
  */
 
-const MIN_ELAPSED_MS = 7000;
 const INIT_MAX_AGE_SEC = 3600;
 const TOKEN_TTL_SEC = 300;
 
@@ -13,13 +17,10 @@ export default {
     if (request.method === "OPTIONS") {
       return cors(new Response(null, { status: 204 }));
     }
-
     const url = new URL(request.url);
-
     if (request.method === "GET" && url.pathname === "/") {
-      return cors(json({ ok: true, service: "iz-device-verify", v: 1 }));
+      return cors(json({ ok: true, service: "iz-device-verify", v: 2 }));
     }
-
     if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/verify")) {
       try {
         return cors(await handleVerify(request, env));
@@ -27,7 +28,6 @@ export default {
         return cors(json({ ok: false, reason: "server_error", detail: String(e && e.message || e) }, 500));
       }
     }
-
     return cors(json({ ok: false, reason: "not_found" }, 404));
   },
 };
@@ -46,24 +46,9 @@ async function handleVerify(request, env) {
 
   const initData = String(body.initData || "");
   const fingerprint = String(body.fingerprint || body.fp || "").slice(0, 128);
-  const t0 = Number(body.t0 || 0);
   const turnstileToken = String(body.turnstileToken || body.cf_turnstile_response || "");
   const platform = String(body.platform || "").slice(0, 32);
   const now = Date.now();
-
-  if (!t0 || !Number.isFinite(t0) || t0 > now + 2000) {
-    return json({ ok: false, reason: "too_fast", ban: true, detail: "invalid_t0" });
-  }
-  const elapsed = now - t0;
-  if (elapsed < MIN_ELAPSED_MS) {
-    return json({
-      ok: false,
-      reason: "too_fast",
-      ban: true,
-      elapsed_ms: elapsed,
-      detail: "submitted_before_7s",
-    });
-  }
 
   if (env.TURNSTILE_SECRET) {
     if (!turnstileToken) {
@@ -102,33 +87,17 @@ async function handleVerify(request, env) {
   if (kv) {
     const devKey = "dev:" + fingerprint;
     const ipKey = "ip:" + ip;
-
     const existingDev = await kv.get(devKey);
     if (existingDev && existingDev !== uid) {
-      return json({
-        ok: false,
-        reason: "multi_device",
-        ban: true,
-        detail: "device_used_by_" + existingDev,
-      });
+      return json({ ok: false, reason: "multi_device", ban: true, detail: "device_used_by_" + existingDev });
     }
-
     const existingIp = await kv.get(ipKey);
     if (existingIp && existingIp !== uid) {
-      return json({
-        ok: false,
-        reason: "multi_ip",
-        ban: true,
-        detail: "ip_used_by_" + existingIp,
-      });
+      return json({ ok: false, reason: "multi_ip", ban: true, detail: "ip_used_by_" + existingIp });
     }
-
     await kv.put(devKey, uid);
     await kv.put(ipKey, uid);
-    await kv.put(
-      "user:" + uid,
-      JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) })
-    );
+    await kv.put("user:" + uid, JSON.stringify({ fp: fingerprint, ip, platform, at: Math.floor(now / 1000) }));
   }
 
   const exp = Math.floor(now / 1000) + TOKEN_TTL_SEC;
@@ -136,17 +105,7 @@ async function handleVerify(request, env) {
   const sig = await hmacHex(env.RESULT_SECRET, payload);
   const token = payload + "|" + sig;
 
-  return json({
-    ok: true,
-    reason: "pass",
-    ban: false,
-    uid,
-    ip,
-    fingerprint,
-    exp,
-    token,
-    elapsed_ms: elapsed,
-  });
+  return json({ ok: true, reason: "pass", ban: false, uid, ip, fingerprint, exp, token });
 }
 
 function clientIp(request) {
@@ -163,7 +122,6 @@ async function validateInitData(initData, botToken, maxAgeSec) {
     const params = new URLSearchParams(initData);
     const hash = params.get("hash");
     if (!hash) return { ok: false, detail: "no_hash" };
-
     const pairs = [];
     for (const [k, v] of params.entries()) {
       if (k === "hash" || k === "signature") continue;
@@ -171,44 +129,25 @@ async function validateInitData(initData, botToken, maxAgeSec) {
     }
     pairs.sort();
     const dataCheckString = pairs.join("\n");
-
     const enc = new TextEncoder();
     const secretKey = await crypto.subtle.importKey(
       "raw",
       await crypto.subtle.sign(
         "HMAC",
-        await crypto.subtle.importKey(
-          "raw",
-          enc.encode("WebAppData"),
-          { name: "HMAC", hash: "SHA-256" },
-          false,
-          ["sign"]
-        ),
+        await crypto.subtle.importKey("raw", enc.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
         enc.encode(botToken)
       ),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"]
     );
-
     const sigBuf = await crypto.subtle.sign("HMAC", secretKey, enc.encode(dataCheckString));
-    const computed = [...new Uint8Array(sigBuf)]
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    if (computed !== hash.toLowerCase()) {
-      return { ok: false, detail: "bad_hash" };
-    }
-
+    const computed = [...new Uint8Array(sigBuf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    if (computed !== hash.toLowerCase()) return { ok: false, detail: "bad_hash" };
     const authDate = parseInt(params.get("auth_date") || "0", 10);
     const nowSec = Math.floor(Date.now() / 1000);
-    if (!authDate || nowSec - authDate > maxAgeSec) {
-      return { ok: false, detail: "expired" };
-    }
-    if (authDate > nowSec + 60) {
-      return { ok: false, detail: "auth_in_future" };
-    }
-
+    if (!authDate || nowSec - authDate > maxAgeSec) return { ok: false, detail: "expired" };
+    if (authDate > nowSec + 60) return { ok: false, detail: "auth_in_future" };
     let userId = "";
     const userRaw = params.get("user");
     if (userRaw) {
@@ -218,7 +157,6 @@ async function validateInitData(initData, botToken, maxAgeSec) {
       } catch (_) {}
     }
     if (!userId) return { ok: false, detail: "no_user" };
-
     return { ok: true, userId, authDate };
   } catch (e) {
     return { ok: false, detail: "validate_error:" + String(e && e.message || e) };
@@ -244,7 +182,6 @@ async function checkVpn(ip, proxycheckKey) {
       }
     }
   } catch (_) {}
-
   try {
     const r2 = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, { cf: { cacheTtl: 120 } });
     if (r2.ok) {
@@ -256,7 +193,6 @@ async function checkVpn(ip, proxycheckKey) {
       }
     }
   } catch (_) {}
-
   return { vpn: false, detail: "clean" };
 }
 
