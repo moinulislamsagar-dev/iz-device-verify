@@ -1,7 +1,10 @@
 /**
- * IZ Earn Device Verify Worker v7
- * Fixed Web Crypto HMAC buffer handling (ArrayBuffer / Uint8Array)
- * Algorithm verified against official Telegram sample (Python match)
+ * IZ Earn Device Verify Worker v8
+ *
+ * Validates initData two ways:
+ *  A) HMAC hash with BOT_TOKEN (classic)
+ *  B) Ed25519 "signature" with Telegram production public key + bot_id
+ *     (Bot API 8.0+; works even if hash path has edge issues)
  *
  * Secrets: BOT_TOKEN, RESULT_SECRET, TURNSTILE_SECRET
  * KV: VERIFY_KV
@@ -9,6 +12,9 @@
 
 const INIT_MAX_AGE_SEC = 86400;
 const VERIFY_TTL_SEC = 600;
+// https://docs.telegram-mini-apps.com/platform/init-data
+const TG_PROD_ED25519_HEX =
+  "e7bf03a2fa4602af4580703d88dda5bb59f32ed8b02a56c187fe7d34caed242d";
 
 export default {
   async fetch(request, env) {
@@ -21,23 +27,19 @@ export default {
       return cors(json({
         ok: true,
         service: "iz-device-verify",
-        v: 7,
-        mode: "strict_initdata",
+        v: 8,
+        mode: "strict_initdata_hmac_or_ed25519",
       }));
     }
-
     if (request.method === "GET" && url.pathname === "/diag") {
       return cors(handleDiag(env, url, request));
     }
-
     if (request.method === "GET" && url.pathname === "/whoami") {
       return cors(await handleWhoami(env));
     }
-
     if (request.method === "GET" && url.pathname === "/check") {
       return cors(await handleCheck(request, env, url));
     }
-
     if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/verify")) {
       try {
         return cors(await handleVerify(request, env));
@@ -49,14 +51,12 @@ export default {
         }, 500));
       }
     }
-
     return cors(json({ ok: false, reason: "not_found" }, 404));
   },
 };
 
 function cleanToken(raw) {
-  let t = String(raw || "");
-  t = t.replace(/^\uFEFF/, "").trim();
+  let t = String(raw || "").replace(/^\uFEFF/, "").trim();
   if (
     (t.startsWith('"') && t.endsWith('"')) ||
     (t.startsWith("'") && t.endsWith("'"))
@@ -75,6 +75,28 @@ function toBytes(data) {
   return new TextEncoder().encode(String(data));
 }
 
+function toHex(bytes) {
+  return [...toBytes(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex) {
+  const h = String(hex).replace(/\s/g, "");
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(h.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+function b64urlToBytes(s) {
+  let b64 = String(s).replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4) b64 += "=";
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 async function hmacSha256(keyData, messageData) {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -83,12 +105,114 @@ async function hmacSha256(keyData, messageData) {
     false,
     ["sign"]
   );
-  const sig = await crypto.subtle.sign("HMAC", key, toBytes(messageData));
-  return new Uint8Array(sig);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, toBytes(messageData)));
 }
 
-function toHex(bytes) {
-  return [...toBytes(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+/** Parse initData into map of decoded values */
+function parseMap(initData) {
+  const map = {};
+  const params = new URLSearchParams(initData);
+  for (const [k, v] of params.entries()) map[k] = v;
+  return map;
+}
+
+/** Sorted data-check-string excluding hash + signature */
+function dataCheckString(map) {
+  const pairs = [];
+  for (const k of Object.keys(map)) {
+    if (k === "hash" || k === "signature") continue;
+    pairs.push(k + "=" + map[k]);
+  }
+  pairs.sort();
+  return pairs.join("\n");
+}
+
+async function validateHmac(map, botToken) {
+  const hash = map.hash;
+  if (!hash) return false;
+  const dcs = dataCheckString(map);
+  const secretKey = await hmacSha256("WebAppData", botToken);
+  const computed = toHex(await hmacSha256(secretKey, dcs));
+  return computed === String(hash).toLowerCase();
+}
+
+/**
+ * Third-party Ed25519 validation (Telegram production key).
+ * Message = `${botId}:WebAppData\n` + data_check_string
+ */
+async function validateEd25519(map, botId) {
+  const sig = map.signature;
+  if (!sig) return false;
+  const dcs = dataCheckString(map);
+  const message = String(botId) + ":WebAppData\n" + dcs;
+  try {
+    const pub = await crypto.subtle.importKey(
+      "raw",
+      hexToBytes(TG_PROD_ED25519_HEX),
+      { name: "Ed25519" },
+      false,
+      ["verify"]
+    );
+    return await crypto.subtle.verify(
+      "Ed25519",
+      pub,
+      b64urlToBytes(sig),
+      toBytes(message)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function finishUser(map, maxAgeSec) {
+  const authDate = parseInt(map.auth_date || "0", 10);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!authDate || nowSec - authDate > maxAgeSec) {
+    return { ok: false, detail: "expired" };
+  }
+  if (authDate > nowSec + 120) {
+    return { ok: false, detail: "auth_in_future" };
+  }
+  let userId = "";
+  if (map.user) {
+    try {
+      const user = JSON.parse(map.user);
+      if (user && user.id) userId = String(user.id);
+    } catch (_) {}
+  }
+  if (!userId) return { ok: false, detail: "no_user" };
+  return { ok: true, userId, authDate };
+}
+
+async function validateInitData(initData, botToken, maxAgeSec) {
+  const map = parseMap(initData);
+  const keys = Object.keys(map).sort();
+  const botId = botToken.includes(":") ? botToken.split(":")[0] : "";
+
+  const hmacOk = await validateHmac(map, botToken);
+  if (hmacOk) {
+    const fin = finishUser(map, maxAgeSec);
+    if (fin.ok) return { ...fin, method: "hmac" };
+    return fin;
+  }
+
+  // Fallback: Telegram Ed25519 signature (present on modern clients)
+  if (map.signature && botId) {
+    const edOk = await validateEd25519(map, botId);
+    if (edOk) {
+      const fin = finishUser(map, maxAgeSec);
+      if (fin.ok) return { ...fin, method: "ed25519" };
+      return fin;
+    }
+  }
+
+  return {
+    ok: false,
+    detail: "bad_hash",
+    keys: keys.join(","),
+    has_signature: !!map.signature,
+    has_hash: !!map.hash,
+  };
 }
 
 async function handleWhoami(env) {
@@ -128,7 +252,7 @@ function handleDiag(env, url, request) {
   const botId = token.includes(":") ? token.split(":")[0] : "";
   return json({
     ok: true,
-    v: 7,
+    v: 8,
     bot_token_set: token.length > 10,
     bot_token_length: token.length,
     bot_id: botId || null,
@@ -192,7 +316,14 @@ async function handleVerify(request, env) {
     return json({ ok: false, reason: "bad_json" }, 400);
   }
 
-  const initData = String(body.initData || "").trim();
+  let initData = String(body.initData || "").trim();
+  // Optional base64 transport
+  if (body.initDataB64) {
+    try {
+      initData = atob(String(body.initDataB64));
+    } catch (_) {}
+  }
+
   const fingerprint = String(body.fingerprint || body.fp || "").slice(0, 128);
   const turnstileToken = String(body.turnstileToken || body.cf_turnstile_response || "");
   const platform = String(body.platform || "").slice(0, 32);
@@ -216,7 +347,9 @@ async function handleVerify(request, env) {
       ban: false,
       detail: initResult.detail,
       init_len: initData.length,
-      has_hash: initData.indexOf("hash=") >= 0,
+      keys: initResult.keys,
+      has_signature: initResult.has_signature,
+      has_hash: initResult.has_hash,
       worker_bot_id: botToken.includes(":") ? botToken.split(":")[0] : "?",
     });
   }
@@ -302,6 +435,7 @@ async function handleVerify(request, env) {
     fingerprint,
     exp,
     token,
+    method: initResult.method || "hmac",
   });
 }
 
@@ -312,87 +446,6 @@ function clientIp(request) {
     (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
     ""
   );
-}
-
-/**
- * Official algorithm (matches Telegram sample + Python hmac):
- * secret_key = HMAC_SHA256(key="WebAppData", msg=bot_token)
- * hash = hex(HMAC_SHA256(key=secret_key, msg=data_check_string))
- * data_check_string = sorted key=value joined by \n, excluding hash & signature
- */
-async function validateInitData(initData, botToken, maxAgeSec) {
-  try {
-    const params = new URLSearchParams(initData);
-    const hash = params.get("hash");
-    if (!hash) return { ok: false, detail: "no_hash" };
-
-    const pairs = [];
-    for (const [k, v] of params.entries()) {
-      if (k === "hash" || k === "signature") continue;
-      pairs.push(k + "=" + v);
-    }
-    pairs.sort();
-    const dataCheckString = pairs.join("\n");
-
-    // key = "WebAppData", message = botToken
-    const secretKey = await hmacSha256("WebAppData", botToken);
-    const computed = toHex(await hmacSha256(secretKey, dataCheckString));
-
-    if (computed !== String(hash).toLowerCase()) {
-      // Retry with manual parse (edge decode cases)
-      const map = {};
-      for (const part of initData.split("&")) {
-        const eq = part.indexOf("=");
-        if (eq < 0) continue;
-        const k = decodeURIComponent(part.slice(0, eq));
-        let v = part.slice(eq + 1);
-        try {
-          v = decodeURIComponent(v.replace(/\+/g, " "));
-        } catch (_) {}
-        map[k] = v;
-      }
-      if (map.hash) {
-        const pairs2 = [];
-        for (const k of Object.keys(map)) {
-          if (k === "hash" || k === "signature") continue;
-          pairs2.push(k + "=" + map[k]);
-        }
-        pairs2.sort();
-        const dcs2 = pairs2.join("\n");
-        const computed2 = toHex(await hmacSha256(secretKey, dcs2));
-        if (computed2 === String(map.hash).toLowerCase()) {
-          return finishParse(map, maxAgeSec);
-        }
-      }
-      return { ok: false, detail: "bad_hash" };
-    }
-
-    const map = {};
-    for (const [k, v] of params.entries()) map[k] = v;
-    return finishParse(map, maxAgeSec);
-  } catch (e) {
-    return { ok: false, detail: "validate_error:" + String(e && e.message || e) };
-  }
-}
-
-function finishParse(map, maxAgeSec) {
-  const authDate = parseInt(map.auth_date || "0", 10);
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (!authDate || nowSec - authDate > maxAgeSec) {
-    return { ok: false, detail: "expired" };
-  }
-  if (authDate > nowSec + 120) {
-    return { ok: false, detail: "auth_in_future" };
-  }
-  let userId = "";
-  if (map.user) {
-    try {
-      const user = JSON.parse(map.user);
-      if (user && user.id) userId = String(user.id);
-    } catch (_) {}
-  }
-  if (!userId) return { ok: false, detail: "no_user" };
-  return { ok: true, userId, authDate };
 }
 
 async function checkVpn(ip, proxycheckKey) {
