@@ -27,7 +27,7 @@ export default {
       return cors(json({
         ok: true,
         service: "iz-device-verify",
-        v: 8,
+        v: 9,
         mode: "strict_initdata_hmac_or_ed25519",
       }));
     }
@@ -252,7 +252,7 @@ function handleDiag(env, url, request) {
   const botId = token.includes(":") ? token.split(":")[0] : "";
   return json({
     ok: true,
-    v: 8,
+    v: 9,
     bot_token_set: token.length > 10,
     bot_token_length: token.length,
     bot_id: botId || null,
@@ -449,56 +449,121 @@ function clientIp(request) {
 }
 
 async function checkVpn(ip, proxycheckKey) {
+  /**
+   * Low false-positive VPN check for real users on home Wi‑Fi / mobile data.
+   * Block only on STRONG signals (explicit VPN / Tor / SOCKS).
+   * Do NOT block on weak "proxy=yes" for Residential / ISP / Business types
+   * (those APIs often mis-flag home Wi‑Fi).
+   */
+  let strongHits = 0;
+  const details = [];
+
+  // --- 1) proxycheck.io: only explicit bad types + high risk ---
   try {
     const q = proxycheckKey
       ? `https://proxycheck.io/v2/${encodeURIComponent(ip)}?key=${encodeURIComponent(proxycheckKey)}&vpn=1&asn=1&risk=1`
       : `https://proxycheck.io/v2/${encodeURIComponent(ip)}?vpn=1&asn=1&risk=1`;
-    const r = await fetch(q, { cf: { cacheTtl: 60 } });
+    const r = await fetch(q, { cf: { cacheTtl: 120 } });
     if (r.ok) {
       const d = await r.json();
       const node = d && d[ip];
       if (node) {
-        const proxy = String(node.proxy || "").toLowerCase();
         const type = String(node.type || "").toLowerCase();
         const risk = Number(node.risk || 0);
-        if (proxy === "yes") return { vpn: true, detail: "proxycheck:proxy" };
-        if (
-          type.includes("vpn") ||
-          type.includes("tor") ||
-          type.includes("socks") ||
-          type.includes("proxy")
-        ) {
-          return { vpn: true, detail: "proxycheck:" + type };
+        // Explicit network types only — NOT generic proxy=yes on ISP/Residential
+        if (type.includes("tor")) {
+          strongHits += 2;
+          details.push("proxycheck:tor");
+        } else if (type === "vpn" || type.includes("vpn")) {
+          strongHits += 1;
+          details.push("proxycheck:vpn");
+        } else if (type.includes("socks") || type === "socks4" || type === "socks5") {
+          strongHits += 1;
+          details.push("proxycheck:socks");
+        } else if (type.includes("http") && type.includes("proxy")) {
+          strongHits += 1;
+          details.push("proxycheck:http_proxy");
         }
-        if (risk >= 66) return { vpn: true, detail: "proxycheck:risk:" + risk };
+        // Very high risk alone (commercial VPN lists) — threshold 90 to spare home Wi‑Fi
+        if (risk >= 90 && (type.includes("vpn") || type.includes("tor") || type.includes("socks"))) {
+          strongHits += 1;
+          details.push("proxycheck:risk" + risk);
+        }
+        // Explicitly IGNORE: Residential, Business, Education, Clothing, etc.
       }
     }
   } catch (_) {}
+
+  // --- 2) ip-api.com (HTTP free): proxy flag + not mobile ---
   try {
-    const r2 = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, { cf: { cacheTtl: 60 } });
+    const r = await fetch(
+      `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,proxy,hosting,mobile,query`,
+      { cf: { cacheTtl: 120 } }
+    );
+    if (r.ok) {
+      const d = await r.json();
+      if (d && d.status === "success") {
+        // proxy:true on ip-api is relatively strict; still require non-mobile
+        if (d.proxy === true && d.mobile !== true) {
+          strongHits += 1;
+          details.push("ip-api:proxy");
+        }
+        // hosting alone is NOT enough (CDN/ISP CGNAT false positives)
+      }
+    }
+  } catch (_) {}
+
+  // --- 3) ipwho.is: only vpn/tor true, ignore vague proxy on residential ---
+  try {
+    const r2 = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, { cf: { cacheTtl: 120 } });
     if (r2.ok) {
       const d2 = await r2.json();
       if (d2 && d2.success !== false && d2.security) {
         const s = d2.security;
-        if (s.vpn === true || s.proxy === true || s.tor === true || s.relay === true) {
-          return { vpn: true, detail: "ipwho" };
+        if (s.tor === true) {
+          strongHits += 2;
+          details.push("ipwho:tor");
+        } else if (s.vpn === true) {
+          strongHits += 1;
+          details.push("ipwho:vpn");
+        }
+        // s.proxy / s.relay alone often false-positive on carrier Wi‑Fi — ignore unless +vpn
+      }
+    }
+  } catch (_) {}
+
+  // --- 4) IPLogs free API (low FP design) — block only vpn_detected ---
+  try {
+    const r3 = await fetch(`https://api.iplogs.com/v1/${encodeURIComponent(ip)}`, {
+      cf: { cacheTtl: 120 },
+    });
+    if (r3.ok) {
+      const d3 = await r3.json();
+      const verdict = String((d3 && (d3.verdict || d3.status || d3.result)) || "").toLowerCase();
+      if (verdict === "vpn_detected" || verdict === "tor" || d3.is_tor === true) {
+        strongHits += 2;
+        details.push("iplogs:" + verdict);
+      } else if (verdict === "vpn_likely" && d3 && d3.score >= 0.85) {
+        strongHits += 1;
+        details.push("iplogs:vpn_likely");
+      }
+      if (d3 && (d3.is_vpn === true || d3.vpn === true) && d3.is_tor !== false) {
+        if (d3.is_tor === true) {
+          strongHits += 2;
+          details.push("iplogs:tor_flag");
         }
       }
     }
   } catch (_) {}
-  try {
-    const r3 = await fetch(`https://api.ipapi.is/?q=${encodeURIComponent(ip)}`, {
-      cf: { cacheTtl: 60 },
-    });
-    if (r3.ok) {
-      const d3 = await r3.json();
-      if (d3 && (d3.is_vpn === true || d3.is_proxy === true || d3.is_tor === true)) {
-        return { vpn: true, detail: "ipapi.is" };
-      }
-    }
-  } catch (_) {}
-  return { vpn: false, detail: "clean" };
+
+  // Need at least 2 strong points OR a Tor hit (already +2)
+  // Single weak API opinion is not enough to block home Wi‑Fi
+  if (strongHits >= 2) {
+    return { vpn: true, detail: details.join(",") || "consensus" };
+  }
+  return { vpn: false, detail: details.length ? "weak:" + details.join(",") : "clean" };
 }
+
 
 async function verifyTurnstile(token, secret, ip) {
   try {
